@@ -169,7 +169,7 @@ class GrepLogs(EventLogSelectionMixin, MultiOutputMapReduceJobTask):
     def mapper(self, line):
         for idx, pattern in enumerate(self.patterns):
             if pattern in line:
-                return idx, line
+                yield idx, line
 
     def multi_output_reducer(self, _key, values, output_file):
         for value in values:
