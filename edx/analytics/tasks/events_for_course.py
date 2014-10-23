@@ -3,6 +3,7 @@ from collections import defaultdict
 import json
 import math
 import os
+import gzip
 
 import luigi
 
@@ -172,9 +173,13 @@ class GrepLogs(EventLogSelectionMixin, MultiOutputMapReduceJobTask):
                 yield idx, line
 
     def multi_output_reducer(self, _key, values, output_file):
-        for value in values:
-            output_file.write(value.strip())
-            output_file.write('\n')
+        outfile = gzip.GzipFile(mode='wb', fileobj=output_file)
+        try:
+            for value in values:
+                outfile.write(value.strip())
+                outfile.write('\n')
+        finally:
+            outfile.close()
 
     def output_path_for_key(self, key):
-        return url_path_join(self.output_root, 'pattern_{}'.format(key))
+        return url_path_join(self.output_root, 'pattern_{}.gz'.format(key))
