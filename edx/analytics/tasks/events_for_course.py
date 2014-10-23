@@ -159,3 +159,22 @@ class EventStats(object):
         self.count += 1
         self.size += metadata['size']
         return self
+
+
+class GrepLogs(EventLogSelectionMixin, MultiOutputMapReduceJobTask):
+
+    patterns = luigi.Parameter(is_list=True, default=[])
+    output_root = luigi.Parameter()
+
+    def mapper(self, line):
+        for idx, pattern in enumerate(self.patterns):
+            if pattern in line:
+                return idx, line
+
+    def multi_output_reducer(self, _key, values, output_file):
+        for value in values:
+            output_file.write(value.strip())
+            output_file.write('\n')
+
+    def output_path_for_key(self, key):
+        return url_path_join(self.output_root, 'pattern_{}'.format(key))
