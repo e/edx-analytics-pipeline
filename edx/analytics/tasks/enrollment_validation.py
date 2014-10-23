@@ -36,10 +36,9 @@ class CourseEnrollmentValidationTask(EventLogSelectionMixin, MapReduceJobTask):
     # TODO: implement.  Decide what happens if event is missing. (Output missing validation event.)
     require_validation = luigi.BooleanParameter(default=False)
 
-    # If set, ignores events that occur before the first validation event.
-    # This is useful for incremental validation.
-    # TODO: implement.
-    ignore_pre_validation = luigi.BooleanParameter(default=False)
+    # If set, generates events that occur before the start of the specified interval.
+    # Default is incremental validation.
+    generate_before = luigi.BooleanParameter(default=False)
 
     def mapper(self, line):
         value = self.get_event_and_date_string(line)
@@ -75,6 +74,7 @@ class CourseEnrollmentValidationTask(EventLogSelectionMixin, MapReduceJobTask):
             log.error("encountered explicit enrollment event with no user_id: %s", event)
             return
 
+        # Pull in extra properties provided only by synthetic enrollment validation events.
         is_active = event_data.get('is_active')
         created = event_data.get('created')
 
@@ -87,7 +87,8 @@ class CourseEnrollmentValidationTask(EventLogSelectionMixin, MapReduceJobTask):
         options = {
             'event_output': self.event_output,
             'require_validation': self.require_validation,
-            'ignore_pre_validation': self.ignore_pre_validation,
+            'generate_before': self.generate_before,
+            'lower_bound_date_string': self.lower_bound_date_string,
         }
         event_stream_processor = ValidateEnrollmentForEvents(
             course_id, user_id, self.interval, values, **options
@@ -104,9 +105,10 @@ class EnrollmentEvent(object):
 
     def __init__(self, timestamp, event_type, is_active, created):
         self.timestamp = timestamp
-        # self.datestamp = eventlog.timestamp_to_datestamp(timestamp)
         self.event_type = event_type
-        self.is_active = is_active
+        # Synthetic events pass "is_active" as a string.
+        # TODO: fix this.
+        self.is_active = (is_active == 'true')
         self.created = created
 
 
@@ -120,7 +122,8 @@ class ValidateEnrollmentForEvents(object):
         self.creation_timestamp = None
         self.event_output = kwargs.get('event_output')
         self.require_validation = kwargs.get('require_validation')
-        self.ignore_pre_validation = kwargs.get('ignore_pre_validation')
+        self.generate_before = kwargs.get('generate_before')
+        self.lower_bound_date_string = kwargs.get('lower_bound_date_string')
 
         if self.event_output:
             self.factory = SyntheticEventFactory(
@@ -131,17 +134,16 @@ class ValidateEnrollmentForEvents(object):
         else:
             self.generate_output = self.create_tuple
 
-        # Create list of events in reverse order:
+        # Create list of events in reverse order, as processing goes backwards
+        # from validation states.
         self.sorted_events = [
             EnrollmentEvent(timestamp, event_type, is_active, created)
             for timestamp, event_type, is_active, created in sorted(events, reverse=True)
         ]
-        # Add a sentinel only if we're creating synthetic events before the current
-        # interval.  If we're validating just within the interval, then skip the sentinel.
-        # TODO: make the option name more accurate.
-        if not self.ignore_pre_validation:
-            initial_state = EnrollmentEvent(None, SENTINEL, is_active=False, created=None)
-            self.sorted_events.append(initial_state)
+
+        # Add a marker event to signal the beginning of the interval.
+        initial_state = EnrollmentEvent(None, SENTINEL, is_active=False, created=None)
+        self.sorted_events.append(initial_state)
 
     def missing_enrolled(self):
         """
@@ -153,13 +155,6 @@ class ValidateEnrollmentForEvents(object):
         # The last element of the list is a placeholder indicating the beginning of the interval.
         # Don't process it.
         num_events = len(self.sorted_events) - 1
-
-        # Make a first pass to see if we have validation events as expected.
-#        if self.ignore_pre_validation:
-#            log.debug("ignoring events before first validation: %d events", num_events)
-#            while num_events > 0 and self.sorted_events[num_events].event_type != VALIDATED:
-#                log.debug("decrementing")
-#                num_events = num_events - 1
 
         all_missing_events = []
         validation_found = False
@@ -222,7 +217,7 @@ class ValidateEnrollmentForEvents(object):
         VALIDATED: "validate",
         ACTIVATED: "activate",
         DEACTIVATED: "deactivate",
-        SENTINEL: "",
+        SENTINEL: "start",
     }
 
     def _get_state_string(self, event):
@@ -269,7 +264,12 @@ class ValidateEnrollmentForEvents(object):
                 if curr_event.is_active:
                     return [self.generate_output(timestamp, ACTIVATED, reason, prev, curr)]
             elif prev_type == SENTINEL:
-                if curr_event.is_active:
+                # If we are validating only within an interval and the create_timestamp
+                # is outside this interval, we can't know whether the events are really
+                # missing or just not included.
+                if not self.generate_before and self.creation_timestamp < self.lower_bound_date_string:
+                    pass
+                elif curr_event.is_active:
                     # TODO: check that creation_timestamp is before 'curr'
                     return [self.generate_output(
                         self.creation_timestamp, ACTIVATED, reason, self.creation_timestamp, curr
@@ -307,13 +307,20 @@ class ValidateEnrollmentForEvents(object):
                 # TODO: check that creation_timestamp is before 'curr'
                 # Note:  we are getting a significant number of deactivate events
                 # without any later validation, so the creation timestamp is 'None'.
-                if self.creation_timestamp:
+
+                # If we had a validation after the deactivation,
+                # and it provided a creation_timestamp within the interval,
+                # then there should be an activate within the interval.
+                if self.creation_timestamp and (
+                        self.generate_before or
+                        self.creation_timestamp >= self.lower_bound_date_string):
                     return [self.generate_output(
                         self.creation_timestamp, ACTIVATED, reason, self.creation_timestamp, curr
                     )]
-                else:
+                elif self.generate_before:
                     # For now, hack the timestamp by making it the same as the deactivate,
                     # so that it at least has a value.
+                    # TODO: generate a timestamp a little *before* the current value.
                     return [self.generate_output(curr, ACTIVATED, reason, prev, curr)]
 
 
