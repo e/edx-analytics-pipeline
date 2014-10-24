@@ -205,15 +205,39 @@ class ValidateEnrollmentForEvents(object):
 
         return json.dumps(event)
 
-    def _get_fake_timestamp(self, after, _before):
+    def _add_microseconds(self, timestamp, microseconds):
+        """
+        Add given microseconds to a timestamp.
+
+        Input and output are timestamps as ISO format strings.  Microseconds can be negative.
+        """
+        # First try to parse the timestamp string and do simple math, to avoid
+        # the high cost of using strptime to parse in most cases.
+        timestamp_base, microsec_base = timestamp.split('.', 1)
+        microsec_int = int(microsec_base) + microseconds
+        if microsec_int >= 0 and microsec_int < 1000000:
+            return "{}.{}".format(timestamp_base, str(microsec_int).zfill(6))
+
+        # If there's a carry, then just use the datetime library.
+        parsed_timestamp = datetime.datetime.strptime(timestamp, '%Y-%m-%dT%H:%M:%S.%f')
+        newtime = parsed_timestamp + datetime.timedelta(microseconds=microseconds)
+        return newtime.isoformat()
+
+    def _get_fake_timestamp(self, after, before):
         """
         Pick a time in an interval.
 
-        Values are ISO strings.
+        Picks a microsecond after `after`, else a microsecond before `before`.
+
+        Input and output values are ISO format strings.
         """
         # Just pick the time at the beginning of the interval.
-        # TODO: add a second, so they sort in the right order.
-        return after
+        if after:
+            # Add a microsecond to 'after'
+            return self._add_microseconds(after, 1)
+        else:
+            # Subtract a microsecond from 'before'
+            return self._add_microseconds(before, -1)
 
     STATE_MAP = {
         VALIDATED: "validate",
@@ -320,10 +344,10 @@ class ValidateEnrollmentForEvents(object):
                         self.creation_timestamp, ACTIVATED, reason, self.creation_timestamp, curr
                     )]
                 elif self.generate_before:
-                    # For now, hack the timestamp by making it the same as the deactivate,
+                    # For now, hack the timestamp by making it a little before the deactivate,
                     # so that it at least has a value.
-                    # TODO: generate a timestamp a little *before* the current value.
-                    return [self.generate_output(curr, ACTIVATED, reason, prev, curr)]
+                    timestamp2 = self._get_fake_timestamp(None, curr)
+                    return [self.generate_output(timestamp2, ACTIVATED, reason, None, curr)]
 
 
 class CreateEnrollmentValidationEventsTask(MultiOutputMapReduceJobTask):
