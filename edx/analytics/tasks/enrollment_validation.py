@@ -106,9 +106,7 @@ class EnrollmentEvent(object):
     def __init__(self, timestamp, event_type, is_active, created):
         self.timestamp = timestamp
         self.event_type = event_type
-        # Synthetic events pass "is_active" as a string.
-        # TODO: fix this.
-        self.is_active = (is_active == 'true')
+        self.is_active = is_active
         self.created = created
 
 
@@ -208,7 +206,11 @@ class ValidateEnrollmentForEvents(object):
         return json.dumps(event)
 
     def _get_fake_timestamp(self, after, _before):
-        """Pick a time in an interval."""
+        """
+        Pick a time in an interval.
+
+        Values are ISO strings.
+        """
         # Just pick the time at the beginning of the interval.
         # TODO: add a second, so they sort in the right order.
         return after
@@ -405,11 +407,12 @@ class CreateEnrollmentValidationEventsTask(MultiOutputMapReduceJobTask):
             log.error("Encountered bad input: %s", line)
             return
 
-        (_db_id, user_id, encoded_course_id, mysql_created, is_active, mode) = fields
+        (_db_id, user_id, encoded_course_id, mysql_created, mysql_is_active, mode) = fields
 
         # 'created' is of the form '2012-07-25 12:26:22.0', coming out of
         # mysql.  Convert it to isoformat.
         created = self._mysql_datetime_to_isoformat(mysql_created)
+        is_active = (mysql_is_active == "true")
 
         # Note that we do not have several standard properties that we
         # might expect in such an event.  These include a username,
