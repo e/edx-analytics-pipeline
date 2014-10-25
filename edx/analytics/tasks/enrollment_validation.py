@@ -9,8 +9,8 @@ import re
 
 import luigi
 
-from edx.analytics.tasks.mapreduce import MultiOutputMapReduceJobTask, MapReduceJobTask
-from edx.analytics.tasks.pathutil import EventLogSelectionMixin
+from edx.analytics.tasks.mapreduce import MultiOutputMapReduceJobTask, MapReduceJobTask, MapReduceJobTaskMixin
+from edx.analytics.tasks.pathutil import EventLogSelectionMixin, EventLogSelectionDownstreamMixin
 from edx.analytics.tasks.url import get_target_from_url, url_path_join, ExternalURL
 from edx.analytics.tasks.util import eventlog, opaque_key_util
 from edx.analytics.tasks.util.event_factory import SyntheticEventFactory
@@ -23,22 +23,39 @@ VALIDATED = 'edx.course.enrollment.validated'
 SENTINEL = 'edx.course.enrollment.sentinel'
 
 
-class CourseEnrollmentValidationTask(EventLogSelectionMixin, MapReduceJobTask):
-    """Produce a data set that shows which days each user was enrolled in each course."""
+class CourseEnrollmentValidationDownstreamMixin(EventLogSelectionDownstreamMixin, MapReduceJobTaskMixin):
+    """
+    Defines parameters for passing upstream to tasks that use CourseEnrollmentValidationTask.
 
+    Parameters:
+
+        output_root: A URL to a path where output event files will be written.
+
+        event_output:  A flag indicating that output should be in the form of events.
+            Default = tuples.
+
+        generate_before:  A flag indicating that events should be created preceding the specified interval.
+            Default behavior is to suppress the generation of events before the specified interval.
+
+    """
     # location to write output
     output_root = luigi.Parameter()
 
     # flag indicating whether to output synthetic events or tuples
     event_output = luigi.BooleanParameter(default=False)
 
+    # If set, generates events that occur before the start of the specified interval.
+    # Default is incremental validation.
+    generate_before = luigi.BooleanParameter(default=False)
+
     # if set, expects that every user/course combination will have a validation event
     # TODO: implement.  Decide what happens if event is missing. (Output missing validation event.)
     require_validation = luigi.BooleanParameter(default=False)
 
-    # If set, generates events that occur before the start of the specified interval.
-    # Default is incremental validation.
-    generate_before = luigi.BooleanParameter(default=False)
+
+class CourseEnrollmentValidationTask(
+        CourseEnrollmentValidationDownstreamMixin, EventLogSelectionMixin, MapReduceJobTask):
+    """Produce a data set that shows which days each user was enrolled in each course."""
 
     def mapper(self, line):
         value = self.get_event_and_date_string(line)
@@ -93,8 +110,8 @@ class CourseEnrollmentValidationTask(EventLogSelectionMixin, MapReduceJobTask):
         event_stream_processor = ValidateEnrollmentForEvents(
             course_id, user_id, self.interval, values, **options
         )
-        for missing_enroll_event in event_stream_processor.missing_enrolled():
-            yield missing_enroll_event
+        for datestamp, missing_enroll_event in event_stream_processor.missing_enrolled():
+            yield datestamp, missing_enroll_event
 
     def output(self):
         return get_target_from_url(self.output_root)
@@ -173,7 +190,8 @@ class ValidateEnrollmentForEvents(object):
 
     def create_tuple(self, timestamp, event_type, reason, after=None, before=None):
         """TODO"""
-        return (self.course_id, self.user_id, timestamp, event_type, reason, after, before)
+        datestamp = eventlog.timestamp_to_datestamp(timestamp)
+        return datestamp, (self.course_id, self.user_id, timestamp, event_type, reason, after, before)
 
     def synthetic_event(self, timestamp, event_type, reason, after=None, before=None):
         """Create a synthetic event."""
@@ -203,7 +221,8 @@ class ValidateEnrollmentForEvents(object):
         if before:
             synthesized['before_time'] = before
 
-        return json.dumps(event)
+        datestamp = eventlog.timestamp_to_datestamp(timestamp)
+        return datestamp, json.dumps(event)
 
     def _add_microseconds(self, timestamp, microseconds):
         """
@@ -213,15 +232,20 @@ class ValidateEnrollmentForEvents(object):
         """
         # First try to parse the timestamp string and do simple math, to avoid
         # the high cost of using strptime to parse in most cases.
-        timestamp_base, microsec_base = timestamp.split('.', 1)
+        timestamp_base, _period, microsec_base = timestamp.partition('.')
+        if not microsec_base:
+            microsec_base = '0'
+            timestamp = '{datetime}.000000'.format(datetime=timestamp)
         microsec_int = int(microsec_base) + microseconds
         if microsec_int >= 0 and microsec_int < 1000000:
             return "{}.{}".format(timestamp_base, str(microsec_int).zfill(6))
 
         # If there's a carry, then just use the datetime library.
         parsed_timestamp = datetime.datetime.strptime(timestamp, '%Y-%m-%dT%H:%M:%S.%f')
-        newtime = parsed_timestamp + datetime.timedelta(microseconds=microseconds)
-        return newtime.isoformat()
+        newtimestamp = (parsed_timestamp + datetime.timedelta(microseconds=microseconds)).isoformat()
+        if '.' not in newtimestamp:
+            newtimestamp = '{datetime}.000000'.format(datetime=newtimestamp)
+        return newtimestamp
 
     def _get_fake_timestamp(self, after, before):
         """
@@ -350,6 +374,59 @@ class ValidateEnrollmentForEvents(object):
                     return [self.generate_output(timestamp2, ACTIVATED, reason, None, curr)]
 
 
+class CourseEnrollmentValidationPerDateTask(
+        CourseEnrollmentValidationDownstreamMixin, MultiOutputMapReduceJobTask):
+    """
+    Outputs CourseEnrollmentValidationTask according to key (i.e. datestamp).
+
+    Parameters:
+        intermediate_output: a URL for the location to write intermediate output.
+
+        output_root: location where the one-file-per-date outputs
+            are written.
+
+    """
+
+    intermediate_output = luigi.Parameter()
+
+    def requires(self):
+        return CourseEnrollmentValidationTask(
+            mapreduce_engine=self.mapreduce_engine,
+            lib_jar=self.lib_jar,
+            n_reduce_tasks=self.n_reduce_tasks,
+            interval=self.interval,
+            source=self.source,
+            pattern=self.pattern,
+            output_root=self.intermediate_output,
+            event_output=self.event_output,
+            generate_before=self.generate_before,
+        )
+
+    def mapper(self, line):
+        datestamp, values = line.split('\t', 1)
+        yield datestamp, values
+
+    def multi_output_reducer(self, _key, values, output_file):
+        with gzip.GzipFile(mode='wb', fileobj=output_file) as outfile:
+            for value in values:
+                outfile.write(value)
+                outfile.write('\n')
+
+    def output_path_for_key(self, datestamp):
+        if self.event_output:
+            # Match tracking.log-{datestamp}.gz format.
+            filename = u'synthetic_enroll.log-{datestamp}.gz'.format(
+                datestamp=datestamp.replace('-', ''),
+            )
+        else:
+            # Want to have tsv as extension, rather than date.
+            filename = u'synthetic_enroll-{datestamp}.tsv.gz'.format(
+                datestamp=datestamp.replace('-', ''),
+            )
+
+        return url_path_join(self.output_root, filename)
+
+
 class CreateEnrollmentValidationEventsTask(MultiOutputMapReduceJobTask):
     """
     Convert a database dump of course enrollment into log files of validation events.
@@ -374,7 +451,7 @@ class CreateEnrollmentValidationEventsTask(MultiOutputMapReduceJobTask):
     source_dir = luigi.Parameter()
 
     def requires_hadoop(self):
-        # return self.requires()  # default impl
+        # Check first if running locally with Sqoop output.
         target = get_target_from_url(self.source_dir)
         if isinstance(target, luigi.LocalTarget) and os.path.isdir(self.source_dir):
             files = [f for f in os.listdir(self.source_dir) if f.startswith("part")]
@@ -422,7 +499,13 @@ class CreateEnrollmentValidationEventsTask(MultiOutputMapReduceJobTask):
         """
         # TODO: move this into utility, or into mysql-support file.
         date_parts = [int(d) for d in re.split(r'[:\-\. ]', mysql_datetime)]
-        return datetime.datetime(*date_parts).isoformat()
+        if len(date_parts) > 6:
+            tenths = date_parts[6]
+            date_parts[6] = tenths * 100000
+        timestamp = datetime.datetime(*date_parts).isoformat()
+        if '.' not in timestamp:
+            timestamp = '{datetime}.000000'.format(datetime=timestamp)
+        return timestamp
 
     def mapper(self, line):
         # print "calling mapper:  " + line

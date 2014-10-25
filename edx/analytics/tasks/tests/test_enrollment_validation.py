@@ -124,23 +124,25 @@ class CourseEnrollmentValidationTaskLegacyMapTest(InitializeLegacyKeysMixin, Cou
     pass
 
 
-class CourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
-    """
-    Tests to verify that events-per-day-per-user reducer works correctly.
-    """
-    def setUp(self):
-        self.create_task()
-        self.user_id = 0
-        self.course_id = 'foo/bar/baz'
-        self.key = (self.course_id, self.user_id)
+class BaseCourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
+    """Provide common methods for testing CourseEnrollmentValidationTask reducer."""
 
-    def create_task(self, interval='2013-01-01-2014-10-10'):
+    @property
+    def key(self):
+        """Returns key value to simulate output from mapper to pass to reducer."""
+        user_id = 0
+        course_id = 'foo/bar/baz'
+        return (course_id, user_id)
+
+    def create_task(self, generate_before=True, event_output=False):
         """Create a task for testing purposes."""
+        interval = '2013-01-01-2014-10-10'
         fake_param = luigi.DateIntervalParameter()
         self.task = CourseEnrollmentValidationTask(
             interval=fake_param.parse(interval),
             output_root="/fake/output",
-            generate_before=True,
+            generate_before=generate_before,
+            event_output=event_output,
         )
         self.task.init_local()
 
@@ -148,22 +150,33 @@ class CourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
         """Run reducer with provided values hardcoded key."""
         return tuple(self.task.reducer(self.key, values))
 
-    def _check_output(self, inputs, expected):
+    def check_output(self, inputs, expected):
         """Compare generated with expected output."""
-        expected_with_key = tuple([self.key + value for value in expected])
+        expected_with_key = tuple([(key, self.key + value) for key, value in expected])
         self.assertEquals(self._get_reducer_output(inputs), expected_with_key)
 
+
+class CourseEnrollmentValidationTaskReducerTest(BaseCourseEnrollmentValidationTaskReducerTest):
+    """
+    Tests to verify that events-per-day-per-user reducer works correctly.
+    """
+    def setUp(self):
+        self.create_task(generate_before=True)
+
     def test_no_events(self):
-        self._check_output([], tuple())
+        self.check_output([], tuple())
 
     def test_missing_single_enrollment(self):
         inputs = [
             ('2013-09-01T00:00:01.123456', VALIDATED, True, '2013-04-01T00:00:01.123456'),
             # missing activation (4/1)
         ]
-        expected = (('2013-04-01T00:00:01.123456', ACTIVATED, "start => validate(active)",
-                     '2013-04-01T00:00:01.123456', '2013-09-01T00:00:01.123456'),)
-        self._check_output(inputs, expected)
+        expected = (
+            ('2013-04-01',
+             ('2013-04-01T00:00:01.123456', ACTIVATED, "start => validate(active)",
+              '2013-04-01T00:00:01.123456', '2013-09-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
 
     def test_missing_enroll_unenroll(self):
         inputs = [
@@ -172,12 +185,14 @@ class CourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
             # missing activation (4/1)
         ]
         expected = (
-            ('2013-04-01T00:00:01.123456', ACTIVATED, "start => validate(inactive)",
-             '2013-04-01T00:00:01.123456', '2013-09-01T00:00:01.123456'),
-            ('2013-04-01T00:00:01.123457', DEACTIVATED, "start => validate(inactive)",
-             '2013-04-01T00:00:01.123456', '2013-09-01T00:00:01.123456'),
+            ('2013-04-01',
+             ('2013-04-01T00:00:01.123456', ACTIVATED, "start => validate(inactive)",
+              '2013-04-01T00:00:01.123456', '2013-09-01T00:00:01.123456')),
+            ('2013-04-01',
+             ('2013-04-01T00:00:01.123457', DEACTIVATED, "start => validate(inactive)",
+              '2013-04-01T00:00:01.123456', '2013-09-01T00:00:01.123456')),
         )
-        self._check_output(inputs, expected)
+        self.check_output(inputs, expected)
 
     def test_single_enrollment(self):
         inputs = [
@@ -185,7 +200,7 @@ class CourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
             ('2013-04-01T00:00:01.123456', ACTIVATED, None, None),
         ]
         # expect no event.
-        self._check_output(inputs, tuple())
+        self.check_output(inputs, tuple())
 
     def test_single_unenrollment(self):
         inputs = [
@@ -193,18 +208,61 @@ class CourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
             ('2013-05-01T00:00:01.123456', DEACTIVATED, None, None),
             # missing activation
         ]
-        expected = (('2013-04-01T00:00:01.123456', ACTIVATED, "start => deactivate",
-                     '2013-04-01T00:00:01.123456', '2013-05-01T00:00:01.123456'),)
-        self._check_output(inputs, expected)
+        expected = (
+            ('2013-04-01',
+             ('2013-04-01T00:00:01.123456', ACTIVATED, "start => deactivate",
+              '2013-04-01T00:00:01.123456', '2013-05-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
+
+    def test_single_unenrollment_without_ms(self):
+        inputs = [
+            ('2013-09-01T00:00:01.123457', VALIDATED, False, '2013-04-01T00:00:01'),
+            ('2013-05-01T00:00:01.123456', DEACTIVATED, None, None),
+            # missing activation
+        ]
+        expected = (
+            ('2013-04-01',
+             ('2013-04-01T00:00:01', ACTIVATED, "start => deactivate",
+              '2013-04-01T00:00:01', '2013-05-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
 
     def test_single_unvalidated_unenrollment(self):
         inputs = [
             ('2013-05-01T00:00:01.123456', DEACTIVATED, None, None),
             # missing activation
         ]
-        expected = (('2013-05-01T00:00:01.123455', ACTIVATED, "start => deactivate",
-                     None, '2013-05-01T00:00:01.123456'),)
-        self._check_output(inputs, expected)
+        expected = (
+            ('2013-05-01',
+             ('2013-05-01T00:00:01.123455', ACTIVATED, "start => deactivate",
+              None, '2013-05-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
+
+    def test_rollover_unvalidated_unenrollment(self):
+        inputs = [
+            ('2013-05-01T00:00:01.000000', DEACTIVATED, None, None),
+            # missing activation
+        ]
+        expected = (
+            ('2013-05-01',
+             ('2013-05-01T00:00:00.999999', ACTIVATED, "start => deactivate",
+              None, '2013-05-01T00:00:01.000000')),
+        )
+        self.check_output(inputs, expected)
+
+    def test_unvalidated_unenrollment_without_ms(self):
+        inputs = [
+            ('2013-05-01T00:00:01', DEACTIVATED, None, None),
+            # missing activation
+        ]
+        expected = (
+            ('2013-05-01',
+             ('2013-05-01T00:00:00.999999', ACTIVATED, "start => deactivate",
+              None, '2013-05-01T00:00:01')),
+        )
+        self.check_output(inputs, expected)
 
     def test_single_enroll_unenroll(self):
         inputs = [
@@ -213,16 +271,16 @@ class CourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
             ('2013-04-01T00:00:01.123456', ACTIVATED, None, None),
         ]
         # expect no event.
-        self._check_output(inputs, tuple())
+        self.check_output(inputs, tuple())
 
     def test_single_unenroll_enroll(self):
         inputs = [
-            ('2013-09-01T00:00:01.123457', ACTIVATED, None, None),
+            ('2013-09-01T00:00:01.123456', ACTIVATED, None, None),
             ('2013-05-01T00:00:01.123456', DEACTIVATED, None, None),
             ('2013-04-01T00:00:01.123456', ACTIVATED, None, None),
         ]
         # expect no event.
-        self._check_output(inputs, tuple())
+        self.check_output(inputs, tuple())
 
     def test_multiple_validation(self):
         inputs = [
@@ -232,7 +290,7 @@ class CourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
             ('2013-01-01T00:00:01.123456', ACTIVATED, None, None),
         ]
         # expect no event.
-        self._check_output(inputs, tuple())
+        self.check_output(inputs, tuple())
 
     def test_multiple_validation_without_enroll(self):
         inputs = [
@@ -241,9 +299,12 @@ class CourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
             ('2013-07-01T00:00:01.123456', VALIDATED, True, '2013-04-01T00:00:01.123456'),
             # missing activation
         ]
-        expected = (('2013-04-01T00:00:01.123456', ACTIVATED, "start => validate(active)",
-                     '2013-04-01T00:00:01.123456', '2013-07-01T00:00:01.123456'),)
-        self._check_output(inputs, expected)
+        expected = (
+            ('2013-04-01',
+             ('2013-04-01T00:00:01.123456', ACTIVATED, "start => validate(active)",
+              '2013-04-01T00:00:01.123456', '2013-07-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
 
     def test_enroll_unenroll_with_validations(self):
         inputs = [
@@ -253,7 +314,7 @@ class CourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
             ('2013-04-01T00:00:01.123456', ACTIVATED, None, None),
         ]
         # expect no event.
-        self._check_output(inputs, tuple())
+        self.check_output(inputs, tuple())
 
     def test_missing_activate_between_validation(self):
         inputs = [
@@ -263,9 +324,12 @@ class CourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
             ('2013-05-01T00:00:01.123456', DEACTIVATED, None, None),
             ('2013-04-01T00:00:01.123456', ACTIVATED, None, None),
         ]
-        expected = (('2013-08-01T00:00:01.123457', ACTIVATED, "validate(inactive) => validate(active)",
-                     '2013-08-01T00:00:01.123456', '2013-09-01T00:00:01.123456'),)
-        self._check_output(inputs, expected)
+        expected = (
+            ('2013-08-01',
+             ('2013-08-01T00:00:01.123457', ACTIVATED, "validate(inactive) => validate(active)",
+              '2013-08-01T00:00:01.123456', '2013-09-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
 
     def test_missing_deactivate_between_validation(self):
         inputs = [
@@ -274,9 +338,12 @@ class CourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
             ('2013-08-01T00:00:01.123456', VALIDATED, True, '2013-04-01T00:00:01.123456'),
             ('2013-01-01T00:00:01.123456', ACTIVATED, None, None),
         ]
-        expected = (('2013-08-01T00:00:01.123457', DEACTIVATED, "validate(active) => validate(inactive)",
-                     '2013-08-01T00:00:01.123456', '2013-09-01T00:00:01.123456'),)
-        self._check_output(inputs, expected)
+        expected = (
+            ('2013-08-01',
+             ('2013-08-01T00:00:01.123457', DEACTIVATED, "validate(active) => validate(inactive)",
+              '2013-08-01T00:00:01.123456', '2013-09-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
 
     def test_missing_deactivate_from_validation(self):
         inputs = [
@@ -285,9 +352,12 @@ class CourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
             ('2013-08-01T00:00:01.123456', VALIDATED, True, '2013-04-01T00:00:01.123456'),
             ('2013-04-01T00:00:01.123456', ACTIVATED, None, None),
         ]
-        expected = (('2013-08-01T00:00:01.123457', DEACTIVATED, "validate(active) => activate",
-                     '2013-08-01T00:00:01.123456', '2013-09-01T00:00:01.123456'),)
-        self._check_output(inputs, expected)
+        expected = (
+            ('2013-08-01',
+             ('2013-08-01T00:00:01.123457', DEACTIVATED, "validate(active) => activate",
+              '2013-08-01T00:00:01.123456', '2013-09-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
 
     def test_missing_deactivate_from_activation(self):
         inputs = [
@@ -295,9 +365,25 @@ class CourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
             # missing deactivation
             ('2013-04-01T00:00:01.123456', ACTIVATED, None, None),
         ]
-        expected = (('2013-04-01T00:00:01.123457', DEACTIVATED, "activate => validate(inactive)",
-                     '2013-04-01T00:00:01.123456', '2013-09-01T00:00:01.123456'),)
-        self._check_output(inputs, expected)
+        expected = (
+            ('2013-04-01',
+             ('2013-04-01T00:00:01.123457', DEACTIVATED, "activate => validate(inactive)",
+              '2013-04-01T00:00:01.123456', '2013-09-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
+
+    def test_rollover_deactivate_from_activation(self):
+        inputs = [
+            ('2013-09-01T00:00:01.123456', VALIDATED, False, '2013-04-01T00:00:01.999999'),
+            # missing deactivation
+            ('2013-04-01T00:00:01.999999', ACTIVATED, None, None),
+        ]
+        expected = (
+            ('2013-04-01',
+             ('2013-04-01T00:00:02.000000', DEACTIVATED, "activate => validate(inactive)",
+              '2013-04-01T00:00:01.999999', '2013-09-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
 
     def test_missing_activate_from_deactivation(self):
         inputs = [
@@ -306,9 +392,12 @@ class CourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
             ('2013-08-01T00:00:01.123456', DEACTIVATED, None, None),
             ('2013-01-01T00:00:01.123456', ACTIVATED, None, None),
         ]
-        expected = (('2013-08-01T00:00:01.123457', ACTIVATED, "deactivate => validate(active)",
-                     '2013-08-01T00:00:01.123456', '2013-09-01T00:00:01.123456'),)
-        self._check_output(inputs, expected)
+        expected = (
+            ('2013-08-01',
+             ('2013-08-01T00:00:01.123457', ACTIVATED, "deactivate => validate(active)",
+              '2013-08-01T00:00:01.123456', '2013-09-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
 
     def test_missing_activate_between_deactivation(self):
         inputs = [
@@ -317,9 +406,12 @@ class CourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
             ('2013-08-01T00:00:01.123456', DEACTIVATED, None, None),
             ('2013-01-01T00:00:01.123456', ACTIVATED, None, None),
         ]
-        expected = (('2013-08-01T00:00:01.123457', ACTIVATED, "deactivate => deactivate",
-                     '2013-08-01T00:00:01.123456', '2013-09-01T00:00:01.123456'),)
-        self._check_output(inputs, expected)
+        expected = (
+            ('2013-08-01',
+             ('2013-08-01T00:00:01.123457', ACTIVATED, "deactivate => deactivate",
+              '2013-08-01T00:00:01.123456', '2013-09-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
 
     def test_missing_deactivate_between_activation(self):
         inputs = [
@@ -327,9 +419,12 @@ class CourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
             # missing deactivation
             ('2013-01-01T00:00:01.123456', ACTIVATED, None, None),
         ]
-        expected = (('2013-01-01T00:00:01.123457', DEACTIVATED, "activate => activate",
-                     '2013-01-01T00:00:01.123456', '2013-09-01T00:00:01.123456'),)
-        self._check_output(inputs, expected)
+        expected = (
+            ('2013-01-01',
+             ('2013-01-01T00:00:01.123457', DEACTIVATED, "activate => activate",
+              '2013-01-01T00:00:01.123456', '2013-09-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
 
     def test_missing_activate_from_validation(self):
         inputs = [
@@ -339,35 +434,20 @@ class CourseEnrollmentValidationTaskReducerTest(unittest.TestCase):
             ('2013-08-01T00:00:01.123456', DEACTIVATED, None, None),
             ('2013-04-01T00:00:01.123456', ACTIVATED, None, None),
         ]
-        expected = (('2013-09-01T00:00:01.123457', ACTIVATED, "validate(inactive) => deactivate",
-                     '2013-09-01T00:00:01.123456', '2013-10-01T00:00:01.123456'),)
-        self._check_output(inputs, expected)
+        expected = (
+            ('2013-09-01',
+             ('2013-09-01T00:00:01.123457', ACTIVATED, "validate(inactive) => deactivate",
+              '2013-09-01T00:00:01.123456', '2013-10-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
 
 
-class CourseEnrollmentValidationTaskEventReducerTest(unittest.TestCase):
+class CourseEnrollmentValidationTaskEventReducerTest(BaseCourseEnrollmentValidationTaskReducerTest):
     """
     Tests to verify that events-per-day-per-user reducer works correctly.
     """
     def setUp(self):
-        self.create_task()
-        self.user_id = 0
-        self.course_id = 'foo/bar/baz'
-        self.key = (self.course_id, self.user_id)
-
-    def create_task(self, interval='2013-01-01-2014-10-10'):
-        """Create a task for testing purposes."""
-        fake_param = luigi.DateIntervalParameter()
-        self.task = CourseEnrollmentValidationTask(
-            interval=fake_param.parse(interval),
-            output_root="/fake/output",
-            event_output=True,
-            generate_before=True,
-        )
-        self.task.init_local()
-
-    def _get_reducer_output(self, values):
-        """Run reducer with provided values hardcoded key."""
-        return tuple(self.task.reducer(self.key, values))
+        self.create_task(event_output=True)
 
     def test_missing_single_enrollment(self):
         inputs = [
@@ -376,7 +456,9 @@ class CourseEnrollmentValidationTaskEventReducerTest(unittest.TestCase):
         ]
         events = self._get_reducer_output(inputs)
         self.assertEquals(len(events), 1)
-        event = json.loads(events[0])
+        datestamp, encoded_event = events[0]
+        self.assertEquals(datestamp, '2013-04-01')
+        event = json.loads(encoded_event)
 
         self.assertEquals(event.get('event_type'), ACTIVATED)
         self.assertEquals(event.get('time'), '2013-04-01T00:00:01.123456')
@@ -387,46 +469,27 @@ class CourseEnrollmentValidationTaskEventReducerTest(unittest.TestCase):
         self.assertEquals(synthesized.get('before_time'), '2013-09-01T00:00:01.123456')
 
 
-class GenerateBeforeDisabledTaskReducerTest(unittest.TestCase):
+class GenerateBeforeDisabledTaskReducerTest(BaseCourseEnrollmentValidationTaskReducerTest):
     """
     Tests to verify that events before first validation event are properly skipped.
     """
     def setUp(self):
-        self.create_task()
-        self.user_id = 0
-        self.course_id = 'foo/bar/baz'
-        self.key = (self.course_id, self.user_id)
-
-    def create_task(self, interval='2013-01-01-2014-10-10'):
-        """Create a task for testing purposes."""
-        fake_param = luigi.DateIntervalParameter()
-        self.task = CourseEnrollmentValidationTask(
-            interval=fake_param.parse(interval),
-            output_root="/fake/output",
-            generate_before=False,
-        )
-        self.task.init_local()
-
-    def _get_reducer_output(self, values):
-        """Run reducer with provided values hardcoded key."""
-        return tuple(self.task.reducer(self.key, values))
-
-    def _check_output(self, inputs, expected):
-        """Compare generated with expected output."""
-        expected_with_key = tuple([self.key + value for value in expected])
-        self.assertEquals(self._get_reducer_output(inputs), expected_with_key)
+        self.create_task(generate_before=False)
 
     def test_no_events(self):
-        self._check_output([], tuple())
+        self.check_output([], tuple())
 
     def test_missing_single_enrollment(self):
         inputs = [
             ('2013-09-01T00:00:01.123456', VALIDATED, True, '2013-04-01T00:00:01.123456'),
             # missing activation (4/1)
         ]
-        expected = (('2013-04-01T00:00:01.123456', ACTIVATED, "start => validate(active)",
-                     '2013-04-01T00:00:01.123456', '2013-09-01T00:00:01.123456'),)
-        self._check_output(inputs, expected)
+        expected = (
+            ('2013-04-01',
+             ('2013-04-01T00:00:01.123456', ACTIVATED, "start => validate(active)",
+              '2013-04-01T00:00:01.123456', '2013-09-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
 
     def test_missing_early_single_enrollment(self):
         inputs = [
@@ -434,7 +497,7 @@ class GenerateBeforeDisabledTaskReducerTest(unittest.TestCase):
             # missing activation (4/1/12)
         ]
         # expect no event.
-        self._check_output(inputs, tuple())
+        self.check_output(inputs, tuple())
 
     def test_single_deactivation(self):
         inputs = [
@@ -442,7 +505,7 @@ class GenerateBeforeDisabledTaskReducerTest(unittest.TestCase):
             # missing activation
         ]
         # expect no event.
-        self._check_output(inputs, tuple())
+        self.check_output(inputs, tuple())
 
     def test_missing_deactivate_from_activation(self):
         inputs = [
@@ -451,10 +514,13 @@ class GenerateBeforeDisabledTaskReducerTest(unittest.TestCase):
             ('2013-04-01T00:00:01.123456', ACTIVATED, None, None),
         ]
         # NO LONGER expect no event.
-        # self._check_output(inputs, tuple())
-        expected = (('2013-04-01T00:00:01.123457', DEACTIVATED, "activate => validate(inactive)",
-                     '2013-04-01T00:00:01.123456', '2013-09-01T00:00:01.123456'),)
-        self._check_output(inputs, expected)
+        # self.check_output(inputs, tuple())
+        expected = (
+            ('2013-04-01',
+             ('2013-04-01T00:00:01.123457', DEACTIVATED, "activate => validate(inactive)",
+              '2013-04-01T00:00:01.123456', '2013-09-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
 
     def test_missing_activate_from_validation(self):
         inputs = [
@@ -462,9 +528,12 @@ class GenerateBeforeDisabledTaskReducerTest(unittest.TestCase):
             ('2013-09-01T00:00:01.123456', DEACTIVATED, None, None),
             # missing activation (4/1)
         ]
-        expected = (('2013-04-01T00:00:01.123456', ACTIVATED, "start => deactivate",
-                     '2013-04-01T00:00:01.123456', '2013-09-01T00:00:01.123456'),)
-        self._check_output(inputs, expected)
+        expected = (
+            ('2013-04-01',
+             ('2013-04-01T00:00:01.123456', ACTIVATED, "start => deactivate",
+              '2013-04-01T00:00:01.123456', '2013-09-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
 
     def test_missing_early_activate_from_validation(self):
         inputs = [
@@ -473,7 +542,7 @@ class GenerateBeforeDisabledTaskReducerTest(unittest.TestCase):
             # missing activation (4/1/12)
         ]
         # expect no event.
-        self._check_output(inputs, tuple())
+        self.check_output(inputs, tuple())
 
     def test_missing_activate_after_validation(self):
         inputs = [
@@ -483,6 +552,9 @@ class GenerateBeforeDisabledTaskReducerTest(unittest.TestCase):
             ('2013-08-01T00:00:01.123456', DEACTIVATED, None, None),
             ('2013-04-01T00:00:01.123456', ACTIVATED, None, None),
         ]
-        expected = (('2013-09-01T00:00:01.123457', ACTIVATED, "validate(inactive) => deactivate",
-                     '2013-09-01T00:00:01.123456', '2013-10-01T00:00:01.123456'),)
-        self._check_output(inputs, expected)
+        expected = (
+            ('2013-09-01',
+             ('2013-09-01T00:00:01.123457', ACTIVATED, "validate(inactive) => deactivate",
+              '2013-09-01T00:00:01.123456', '2013-10-01T00:00:01.123456')),
+        )
+        self.check_output(inputs, expected)
